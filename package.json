@@ -1,0 +1,17 @@
+{
+  "name": "sqlize",
+  "version": "1.0.0",
+  "description": "",
+  "main": "sqlize.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "csv-parser": "^3.0.0",
+    "moment": "^2.29.4",
+    "yargs": "^17.7.2"
+  }
+}

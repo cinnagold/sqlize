@@ -3,6 +3,7 @@ const csv = require("csv-parser");
 const path = require("path");
 const yargs = require("yargs");
 const moment = require("moment");
+const { table } = require("console");
 
 const argv = yargs
   .option("input", {
@@ -16,16 +17,26 @@ const argv = yargs
     describe: "Delimiter used in the CSV file",
     demandOption: true,
     type: "string",
+    default: ",",
   })
   .option("addPrimaryKey", {
     describe: "Add an incrementing primary key to the table schema",
     type: "boolean",
-    default: true,
+    default: false,
   })
   .option("dropTable", {
     describe: "Include a drop table statement",
     type: "boolean",
-    default: false, // Default to not include the drop table statement
+    default: true,
+  })
+  .option("lookup", {
+    describe: "Specify a column for lookup table generation",
+    type: "string",
+  })
+  .option("sqlbatchsize", {
+    describe: "Number of rows to include with each SQL INSERT statement",
+    type: "number",
+    default: 1000,
   })
   .help().argv;
 
@@ -43,7 +54,9 @@ const outputFile = path.join(__dirname, outputFileName);
 
 fs.writeFileSync(outputFile, "");
 
-const tableName = path.basename(inputFile, path.extname(inputFile)); // Extract table name from file name
+const tableName = path
+  .basename(inputFile, path.extname(inputFile))
+  .toLowerCase();
 
 let tableSchema = {};
 
@@ -51,27 +64,87 @@ const rows = [];
 let rowCount = 0;
 let primaryKeyCounter = 1;
 
-fs.createReadStream(inputFile)
-  .pipe(csv({ separator: argv.delimiter }))
-  .on("data", (row) => {
-    if (rowCount++ < 200) {
-      analyzeRow(row);
-    }
-    generateInsertStatement(row);
-  })
-  .on("end", () => {
-    const dropTableStatement = generateDropTableStatement();
-    const createTableStatement = generateCreateTableStatement();
-    fs.appendFileSync(outputFile, dropTableStatement);
-    fs.appendFileSync(outputFile, createTableStatement);
-    fs.appendFileSync(outputFile, rows.join(""));
-    console.log(
-      `SQL statements generated successfully. Output file: ${outputFileName}`
-    );
+let lookupTableName;
+let lookupPkCounter = 1;
+const lookupTableValues = {};
+
+const lookupColumn = argv.lookup;
+if (lookupColumn) {
+  createLookupTable(lookupColumn);
+}
+
+processCSVFile();
+
+function processCSVFile() {
+  fs.createReadStream(inputFile)
+    .pipe(csv({ separator: argv.delimiter }))
+    .on("data", (row) => {
+      if (rowCount++ < 200) {
+        analyzeRow(row);
+      }
+      generateInsertStatement(row);
+    })
+    .on("end", () => {
+      if (lookupColumn) {
+        const lookupTableInsertStatement =
+          generateLookupTableInsertStatements();
+      }
+      const dropTableStatement = generateDropTableStatement(tableName);
+      const createTableStatement = generateCreateTableStatement();
+      fs.appendFileSync(outputFile, dropTableStatement);
+      fs.appendFileSync(outputFile, createTableStatement);
+
+      insertRows();
+      console.log(
+        `SQL statements generated successfully. Output file: ${outputFileName}`
+      );
+    });
+}
+
+function insertRows() {
+  const columnsList = extractColumnsAsList(tableSchema),
+    statements = [];
+
+  for (let i = 0; i < rows.length; i += argv.sqlbatchsize) {
+    const batchData = rows.slice(i, i + argv.sqlbatchsize);
+
+    const sql = `INSERT INTO ${tableName} (${columnsList.join(
+      ", "
+    )})\n VALUES ${batchData.join(",\n")};`;
+    statements.push(sql);
+  }
+  fs.appendFileSync(outputFile, statements.join("\n\n"));
+}
+
+function extractColumnsAsList(schema) {
+  const list = [];
+  Object.keys(schema).forEach((key) => {
+    list.push(key);
   });
+
+  return list;
+}
+
+function generateLookupTableInsertStatements() {
+  const statements = [];
+  Object.keys(lookupTableValues).forEach((key) => {
+    const value = lookupTableValues[key];
+    const insertStatement = `INSERT INTO ${lookupTableName} (id, value) VALUES (${value}, '${escapeSingleQuotes(
+      key
+    )}');`;
+    statements.push(insertStatement);
+  });
+
+  fs.appendFileSync(outputFile, statements.join("\n"));
+}
 
 function analyzeRow(row) {
   for (const [key, value] of Object.entries(row)) {
+    if (key === lookupColumn) {
+      tableSchema[key] = "int";
+      continue;
+    }
+
     if (!tableSchema[key]) {
       // Initialize column data type based on the first encountered value
       tableSchema[key] = inferDataType(value);
@@ -89,6 +162,9 @@ function analyzeRow(row) {
 function inferDataType(value) {
   if (/^-?\d+(\.\d+)?$/.test(value)) {
     if (Number.isInteger(Number(value))) {
+      if (Number(value) > 2147483647) { //Max value for int in MariaDB
+        return "varchar(100)";
+      }
       return "int";
     }
     return "decimal";
@@ -97,20 +173,20 @@ function inferDataType(value) {
   } else if (/^\d{4}-\d{2}-\d{2}/.test(value)) {
     return "date";
   } else {
-    return "text"; // Default to text
+    return "varchar(255)";
   }
 }
 
 function isDatetime(value) {
   return (
-    moment(value, "YYYY-MM-DD HH:mm:ss.SSS", true).isValid() ||
+    moment(value, ["YYYY-MM-DD HH:mm:ss.SSS", "DD-MM-YYYY HH:mm:ss.SSS"], true).isValid() ||
     moment(value, "YYYY/MM/DD HH:mm:ss.SSS", true).isValid()
   );
 }
 
 function isMoreSpecificDataType(currentType, newType) {
   // Compare data types and return true if the new type is more specific
-  const dataTypePriority = ["int", "decimal", "date", "text"];
+  const dataTypePriority = ["int", "decimal", "date", "varchar(100)", "varchar(255)"];
   return (
     dataTypePriority.indexOf(newType) > dataTypePriority.indexOf(currentType)
   );
@@ -131,22 +207,64 @@ function generateCreateTableStatement() {
   );\n`;
 }
 
-function generateDropTableStatement() {
-  return argv.dropTable ? `DROP TABLE IF EXISTS ${tableName};\n` : "";
+function generateDropTableStatement(table) {
+  return argv.dropTable ? `\n\nDROP TABLE IF EXISTS ${table};\n` : "";
 }
 
 function generateInsertStatement(row) {
   const columns = Object.keys(row).join(", ");
   const values = Object.values(row)
-    .map((value) => `'${escapeSingleQuotes(value)}'`)
+    .map((value, index) => {
+      if (Object.keys(row)[index] === argv.lookup) {
+        const lookupValue = escapeSingleQuotes(value);
+        if (!lookupTableValues[lookupValue]) {
+          addLookupValue(lookupValue);
+        }
+        value = lookupTableValues[lookupValue];
+      }
+      return `'${escapeSingleQuotes(value)}'`;
+    })
     .join(", ");
 
-  const primaryKeyValue = argv.addPrimaryKey ? primaryKeyCounter++ : "";
-  const insertStatement = `INSERT INTO ${tableName} (id, ${columns}) VALUES (${primaryKeyValue}, ${values});\n`;
+  if (argv.addPrimaryKey) {
+    const primaryKeyValue = argv.addPrimaryKey ? primaryKeyCounter++ : "";
+    // const insertStatement = `INSERT INTO ${tableName} (id, ${columns}) VALUES (${primaryKeyValue}, ${values});\n`;
+    const insertStatement = `(${primaryKeyValue}, ${values})`;
+    rows.push(insertStatement);
+  } else {
+    // const insertStatement = `INSERT INTO ${tableName} (${columns}) VALUES (${values});\n`;
+    const insertStatement = `(${values})`;
+    rows.push(insertStatement);
+  }
+}
 
-  rows.push(insertStatement);
+function addLookupValue(value) {
+  lookupTableValues[value] = lookupPkCounter++;
 }
 
 function escapeSingleQuotes(value) {
-  return value.replace(/'/g, "''");
+  if (typeof value === "string") {
+    return value.replace(/'/g, "''");
+  }
+  return value;
+}
+
+function createLookupTable(columnName) {
+  lookupTableName = `${tableName}_${columnName}_lookup`;
+
+  const dropTableStatement = generateDropTableStatement(lookupTableName);
+  fs.appendFileSync(outputFile, dropTableStatement);
+
+  const lookupTableSchema = {
+    id: "INT AUTO_INCREMENT PRIMARY KEY",
+    value: "VARCHAR(100)",
+  };
+
+  const lookupTableCreateStatement = `CREATE TABLE IF NOT EXISTS ${lookupTableName} (
+    ${Object.entries(lookupTableSchema)
+      .map(([col, type]) => `${col} ${type}`)
+      .join(",\n")}
+  );\n`;
+
+  fs.appendFileSync(outputFile, lookupTableCreateStatement);
 }

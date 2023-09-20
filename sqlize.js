@@ -59,9 +59,9 @@ const tableName = path
   .toLowerCase();
 
 let tableSchema = {};
+const columnIndexToDataTypeMap = {};
 
 const rows = [];
-let rowCount = 0;
 let primaryKeyCounter = 1;
 
 let lookupTableName;
@@ -73,15 +73,46 @@ if (lookupColumn) {
   createLookupTable(lookupColumn);
 }
 
-processCSVFile();
+analyzeCSVFile();
 
-function processCSVFile() {
-  fs.createReadStream(inputFile)
+function analyzeCSVFile() {
+  let rowCount = 0;
+  const readStream = fs
+    .createReadStream(inputFile)
     .pipe(csv({ separator: argv.delimiter }))
     .on("data", (row) => {
       if (rowCount++ < 200) {
         analyzeRow(row);
+      } else {
+        readStream.destroy();
+        setDefaultDataTypes();
+        createColumnIndexToDataTypeMap();
+        readCSVFile();
       }
+    });
+}
+
+function setDefaultDataTypes() {
+  for (const key in tableSchema) {
+    if (tableSchema.hasOwnProperty(key) && tableSchema[key] === "null") {
+      tableSchema[key] = "varchar(255)";
+    }
+  }
+}
+
+function createColumnIndexToDataTypeMap() {
+  for (const key in tableSchema) {
+    if (tableSchema.hasOwnProperty(key)) {
+      const index = Object.keys(tableSchema).indexOf(key);
+      columnIndexToDataTypeMap[index] = tableSchema[key];
+    }
+  }
+}
+
+function readCSVFile() {
+  fs.createReadStream(inputFile)
+    .pipe(csv({ separator: argv.delimiter }))
+    .on("data", (row) => {
       generateInsertStatement(row);
     })
     .on("end", () => {
@@ -146,28 +177,39 @@ function analyzeRow(row) {
     }
 
     if (!tableSchema[key]) {
-      // Initialize column data type based on the first encountered value
+      // Initialize column data type based on the first encountered
       tableSchema[key] = inferDataType(value);
     } else {
       // If the column data type has already been set, check for a more specific data type
       const currentType = tableSchema[key];
-      const newType = inferDataType(value);
-      if (isMoreSpecificDataType(currentType, newType)) {
-        tableSchema[key] = newType;
+
+      if (value != null && value !== "") {
+        const newType = inferDataType(value);
+        if (isMoreSpecificDataType(currentType, newType)) {
+          tableSchema[key] = newType;
+        }
       }
     }
   }
 }
 
 function inferDataType(value) {
+  if (!value) {
+    return "null";
+  }
+
   if (/^-?\d+(\.\d+)?$/.test(value)) {
     if (Number.isInteger(Number(value))) {
-      if (Number(value) > 2147483647) { //Max value for int in MariaDB
+      if (Number(value) > 2147483647) {
+        //Max value for int in MariaDB
         return "varchar(100)";
+      }
+      if (value === "0.0") {
+        return "decimal(15, 5)";
       }
       return "int";
     }
-    return "decimal";
+    return "decimal(15, 5)";
   } else if (isDatetime(value)) {
     return "datetime";
   } else if (/^\d{4}-\d{2}-\d{2}/.test(value)) {
@@ -179,14 +221,28 @@ function inferDataType(value) {
 
 function isDatetime(value) {
   return (
-    moment(value, ["YYYY-MM-DD HH:mm:ss.SSS", "DD-MM-YYYY HH:mm:ss.SSS"], true).isValid() ||
-    moment(value, "YYYY/MM/DD HH:mm:ss.SSS", true).isValid()
+    moment(
+      value,
+      [
+        "YYYY-MM-DD HH:mm:ss.SSS",
+        "DD-MM-YYYY HH:mm:ss.SSS",
+        "YYYY-MM-DD HH:mm:ssZ",
+      ],
+      true
+    ).isValid() || moment(value, "YYYY/MM/DD HH:mm:ss.SSS", true).isValid()
   );
 }
 
 function isMoreSpecificDataType(currentType, newType) {
   // Compare data types and return true if the new type is more specific
-  const dataTypePriority = ["int", "decimal", "date", "varchar(100)", "varchar(255)"];
+  const dataTypePriority = [
+    "null",
+    "int",
+    "decimal(15, 5)",
+    "date",
+    "varchar(100)",
+    "varchar(255)",
+  ];
   return (
     dataTypePriority.indexOf(newType) > dataTypePriority.indexOf(currentType)
   );
@@ -222,17 +278,15 @@ function generateInsertStatement(row) {
         }
         value = lookupTableValues[lookupValue];
       }
-      return `'${escapeSingleQuotes(value)}'`;
+      return `${quoteIfNeeded(value, columnIndexToDataTypeMap[index])}`;
     })
     .join(", ");
 
   if (argv.addPrimaryKey) {
     const primaryKeyValue = argv.addPrimaryKey ? primaryKeyCounter++ : "";
-    // const insertStatement = `INSERT INTO ${tableName} (id, ${columns}) VALUES (${primaryKeyValue}, ${values});\n`;
     const insertStatement = `(${primaryKeyValue}, ${values})`;
     rows.push(insertStatement);
   } else {
-    // const insertStatement = `INSERT INTO ${tableName} (${columns}) VALUES (${values});\n`;
     const insertStatement = `(${values})`;
     rows.push(insertStatement);
   }
@@ -240,6 +294,19 @@ function generateInsertStatement(row) {
 
 function addLookupValue(value) {
   lookupTableValues[value] = lookupPkCounter++;
+}
+
+function quoteIfNeeded(value, datatype) {
+  const needQuotes = ["varchar(100)", "varchar(255)", "datetime", "date"];
+  if (!value) {
+    return `null`;
+  }
+
+  if (needQuotes.includes(datatype)) {
+    return `'${escapeSingleQuotes(value)}'`;
+  } else {
+    return `${value}`;
+  }
 }
 
 function escapeSingleQuotes(value) {

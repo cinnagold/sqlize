@@ -22,7 +22,17 @@ const argv = yargs
   .option("addPrimaryKey", {
     describe: "Add an incrementing primary key to the table schema",
     type: "boolean",
-    default: false,
+    default: true,
+  })
+  .option("addForeignKeyToFile", {
+    describe:
+      "Add a foreign key column for the default primary key being used in this csv file (note, the delimeter must match across both files)",
+    type: "string",
+  })
+  .option("addForeignKeyColumn", {
+    describe:
+      "The column to use when adding a foreign key column. Note, the column names in both files must match for this foreign key column",
+    type: "string",
   })
   .option("dropTable", {
     describe: "Include a drop table statement",
@@ -60,6 +70,9 @@ const tableName = path
 
 let tableSchema = {};
 const columnIndexToDataTypeMap = {};
+if (argv.addPrimaryKey) {
+  tableSchema["id"] = "INT AUTO_INCREMENT PRIMARY KEY";
+}
 
 const rows = [];
 let primaryKeyCounter = 1;
@@ -73,9 +86,12 @@ if (lookupColumn) {
   createLookupTable(lookupColumn);
 }
 
-analyzeCSVFile();
+let foreignKeyvalues = {};
+if (argv.addForeignKeyToFile || argv.addForeignKeyColumn) {
+  computeForeignKeys(analyzeAndProcessCSVFile);
+}
 
-function analyzeCSVFile() {
+function analyzeAndProcessCSVFile() {
   let rowCount = 0;
   const readStream = fs
     .createReadStream(inputFile)
@@ -253,12 +269,7 @@ function generateCreateTableStatement() {
     .map(([columnName, dataType]) => `${columnName} ${dataType}`)
     .join(",\n  ");
 
-  const primaryKey = argv.addPrimaryKey
-    ? `id INT AUTO_INCREMENT PRIMARY KEY,`
-    : "";
-
   return `CREATE TABLE IF NOT EXISTS ${tableName} (
-  ${primaryKey}
   ${columns}
   );\n`;
 }
@@ -268,7 +279,6 @@ function generateDropTableStatement(table) {
 }
 
 function generateInsertStatement(row) {
-  const columns = Object.keys(row).join(", ");
   const values = Object.values(row)
     .map((value, index) => {
       if (Object.keys(row)[index] === argv.lookup) {
@@ -282,14 +292,16 @@ function generateInsertStatement(row) {
     })
     .join(", ");
 
-  if (argv.addPrimaryKey) {
-    const primaryKeyValue = argv.addPrimaryKey ? primaryKeyCounter++ : "";
-    const insertStatement = `(${primaryKeyValue}, ${values})`;
-    rows.push(insertStatement);
-  } else {
-    const insertStatement = `(${values})`;
-    rows.push(insertStatement);
-  }
+  const primaryKeyValue = argv.addPrimaryKey ? primaryKeyCounter++ : "";
+  const foreignKeyValue = argv.addForeignKeyColumn ? foreignKeyFor(row[argv.addForeignKeyColumn]) : "";
+
+  const insertParts = [primaryKeyValue, foreignKeyValue, values].filter(part => part !== "");
+  const insertStatement = `(${insertParts.join(", ")})`;
+  rows.push(insertStatement);
+}
+
+function foreignKeyFor(value) {
+  return foreignKeyvalues[value];
 }
 
 function addLookupValue(value) {
@@ -334,4 +346,40 @@ function createLookupTable(columnName) {
   );\n`;
 
   fs.appendFileSync(outputFile, lookupTableCreateStatement);
+}
+
+function computeForeignKeys(andThen) {
+  checkForeignKeyArgs();
+
+  tableSchema[`${argv.addForeignKeyColumn}_fk`] = "INT";
+
+  let pkCounter = 0;
+  const readStream = fs
+    .createReadStream(argv.addForeignKeyToFile)
+    .pipe(csv({ separator: argv.delimiter }))
+    .on("data", (row) => {
+      const key = row[argv.addForeignKeyColumn];
+      if (key == "1a6562590ef19d1045d06c4055742d38288e9e6dcd71ccde5cee80f1d5a774eb") {
+        console.log("adding")
+      }
+      // if (foreignKeyvalues[key]) {
+      //   console.log("Duplicate: " + key );
+      // }
+
+      foreignKeyvalues[key] = ++pkCounter;
+    })
+    .on("end", () => {
+      andThen();
+    });
+
+    
+}
+
+function checkForeignKeyArgs() {
+  if (!argv.addForeignKeyColumn || !argv.addForeignKeyToFile) {
+    console.error(
+      "\x1b[31mFAILED\x1b[0m Requires both arguments to be set: addForeignKeyToFile and addForeignKeyColumn"
+    );
+    process.exit(1);
+  }
 }

@@ -34,6 +34,14 @@ const argv = yargs
       "The column to use when adding a foreign key column. Note, the column names in both files must match for this foreign key column",
     type: "string",
   })
+  .option("addBlankColumns", {
+    describe: "A comma-separated list of blank columns to add",
+    type: "string",
+  })
+  .option("forceTextColumns", {
+    describe: "A comma-separated list of columns that should be treated as text columns regardless of their content",
+    type: "string",
+  })
   .option("dropTable", {
     describe: "Include a drop table statement",
     type: "boolean",
@@ -70,9 +78,6 @@ const tableName = path
 
 let tableSchema = {};
 const columnIndexToDataTypeMap = {};
-if (argv.addPrimaryKey) {
-  tableSchema["id"] = "INT AUTO_INCREMENT PRIMARY KEY";
-}
 
 const rows = [];
 let primaryKeyCounter = 1;
@@ -86,9 +91,21 @@ if (lookupColumn) {
   createLookupTable(lookupColumn);
 }
 
+const forceTextColumns= {};
+if (argv.forceTextColumns) {
+  argv.forceTextColumns
+    .split(",")
+    .map((column) => column.trim().toLowerCase())
+    .forEach((column) => {
+      forceTextColumns[column] = true;
+    });
+}
+
 let foreignKeyvalues = {};
 if (argv.addForeignKeyToFile || argv.addForeignKeyColumn) {
   computeForeignKeys(analyzeAndProcessCSVFile);
+} else {
+  analyzeAndProcessCSVFile();
 }
 
 function analyzeAndProcessCSVFile() {
@@ -97,7 +114,7 @@ function analyzeAndProcessCSVFile() {
     .createReadStream(inputFile)
     .pipe(csv({ separator: argv.delimiter }))
     .on("data", (row) => {
-      if (rowCount++ < 200) {
+      if (rowCount++ < 5000) {
         analyzeRow(row);
       } else {
         readStream.destroy();
@@ -192,6 +209,11 @@ function analyzeRow(row) {
       continue;
     }
 
+    if (forceTextColumns[key]) {
+      tableSchema[key] = "varchar(255)";
+      continue;
+    }
+
     if (!tableSchema[key]) {
       // Initialize column data type based on the first encountered
       tableSchema[key] = inferDataType(value);
@@ -236,17 +258,17 @@ function inferDataType(value) {
 }
 
 function isDatetime(value) {
-  return (
-    moment(
-      value,
-      [
-        "YYYY-MM-DD HH:mm:ss.SSS",
-        "DD-MM-YYYY HH:mm:ss.SSS",
-        "YYYY-MM-DD HH:mm:ssZ",
-      ],
-      true
-    ).isValid() || moment(value, "YYYY/MM/DD HH:mm:ss.SSS", true).isValid()
-  );
+  return moment(
+    value,
+    [
+      "YYYY-MM-DD HH:mm:ss.SSS",
+      "DD-MM-YYYY HH:mm:ss.SSS",
+      "YYYY-MM-DD HH:mm:ssZ",
+      "YYYY-MM-DD HH:mm:ss",
+      "YYYY/MM/DD HH:mm:ss.SSS",
+    ],
+    true
+  ).isValid();
 }
 
 function isMoreSpecificDataType(currentType, newType) {
@@ -256,6 +278,7 @@ function isMoreSpecificDataType(currentType, newType) {
     "int",
     "decimal(15, 5)",
     "date",
+    "datetime",
     "varchar(100)",
     "varchar(255)",
   ];
@@ -265,9 +288,25 @@ function isMoreSpecificDataType(currentType, newType) {
 }
 
 function generateCreateTableStatement() {
-  const columns = Object.entries(tableSchema)
+  if (argv.addPrimaryKey) {
+    tableSchema["id"] = "INT AUTO_INCREMENT PRIMARY KEY";
+  }
+  if (argv.addForeignKeyColumn) {
+    tableSchema[`${argv.addForeignKeyColumn}_fk`] = "INT";
+  }
+
+  let columns = Object.entries(tableSchema)
     .map(([columnName, dataType]) => `${columnName} ${dataType}`)
     .join(",\n  ");
+
+  if (argv.addBlankColumns) {
+    const blankColumns = argv.addBlankColumns
+      .split(",")
+      .map((column) => column.trim());
+    blankColumns.forEach((columnName) => {
+      columns += `,\n${columnName.toLowerCase()} varchar(100)`;
+    });
+  }
 
   return `CREATE TABLE IF NOT EXISTS ${tableName} (
   ${columns}
@@ -293,15 +332,19 @@ function generateInsertStatement(row) {
     .join(", ");
 
   const primaryKeyValue = argv.addPrimaryKey ? primaryKeyCounter++ : "";
-  const foreignKeyValue = argv.addForeignKeyColumn ? foreignKeyFor(row[argv.addForeignKeyColumn]) : "";
+  const foreignKeyValue = argv.addForeignKeyColumn
+    ? foreignKeyFor(row[argv.addForeignKeyColumn])
+    : "";
 
-  const insertParts = [primaryKeyValue, foreignKeyValue, values].filter(part => part !== "");
+  const insertParts = [values, primaryKeyValue, foreignKeyValue].filter(
+    (part) => part !== ""
+  );
   const insertStatement = `(${insertParts.join(", ")})`;
   rows.push(insertStatement);
 }
 
 function foreignKeyFor(value) {
-  return foreignKeyvalues[value];
+  return foreignKeyvalues[value] || "NULL";
 }
 
 function addLookupValue(value) {
@@ -309,7 +352,7 @@ function addLookupValue(value) {
 }
 
 function quoteIfNeeded(value, datatype) {
-  const needQuotes = ["varchar(100)", "varchar(255)", "datetime", "date"];
+  const needQuotes = ["varchar(100)", "varchar(255)", "date", "datetime"];
   if (!value) {
     return `null`;
   }
@@ -351,28 +394,21 @@ function createLookupTable(columnName) {
 function computeForeignKeys(andThen) {
   checkForeignKeyArgs();
 
-  tableSchema[`${argv.addForeignKeyColumn}_fk`] = "INT";
-
   let pkCounter = 0;
   const readStream = fs
     .createReadStream(argv.addForeignKeyToFile)
     .pipe(csv({ separator: argv.delimiter }))
     .on("data", (row) => {
       const key = row[argv.addForeignKeyColumn];
-      if (key == "1a6562590ef19d1045d06c4055742d38288e9e6dcd71ccde5cee80f1d5a774eb") {
-        console.log("adding")
+      if (foreignKeyvalues[key]) {
+        console.warn("Found duplicate: " + key);
       }
-      // if (foreignKeyvalues[key]) {
-      //   console.log("Duplicate: " + key );
-      // }
 
       foreignKeyvalues[key] = ++pkCounter;
     })
     .on("end", () => {
       andThen();
     });
-
-    
 }
 
 function checkForeignKeyArgs() {

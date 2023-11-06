@@ -24,6 +24,10 @@ const argv = yargs
     type: "boolean",
     default: true,
   })
+  .option("primaryKeyColumn", {
+    describe: "The name of the column in the file to use as the primary key",
+    type: "string",
+  })
   .option("addForeignKeyToFile", {
     describe:
       "Add a foreign key column for the default primary key being used in this csv file (note, the delimeter must match across both files)",
@@ -50,6 +54,7 @@ const argv = yargs
   .option("lookup", {
     describe: "Specify a column for lookup table generation",
     type: "string",
+    default: ""
   })
   .option("sqlbatchsize", {
     describe: "Number of rows to include with each SQL INSERT statement",
@@ -203,7 +208,8 @@ function generateLookupTableInsertStatements() {
 }
 
 function analyzeRow(row) {
-  for (const [key, value] of Object.entries(row)) {
+  for (let [key, value] of Object.entries(row)) {
+    key = key.toLowerCase();
     if (key === lookupColumn) {
       tableSchema[key] = "int";
       continue;
@@ -258,6 +264,9 @@ function inferDataType(value) {
 }
 
 function isDatetime(value) {
+  let isDateTime = moment(value, "M/D/YY HH:mm", true).isValid();
+
+
   return moment(
     value,
     [
@@ -266,6 +275,7 @@ function isDatetime(value) {
       "YYYY-MM-DD HH:mm:ssZ",
       "YYYY-MM-DD HH:mm:ss",
       "YYYY/MM/DD HH:mm:ss.SSS",
+      "M/D/YY H:mm"
     ],
     true
   ).isValid();
@@ -296,7 +306,14 @@ function generateCreateTableStatement() {
   }
 
   let columns = Object.entries(tableSchema)
-    .map(([columnName, dataType]) => `${columnName} ${dataType}`)
+  .map(([columnName, dataType]) => {
+    const isPrimaryKey = columnName === argv.primaryKeyColumn;
+    if (isPrimaryKey) {
+      return `${columnName} ${dataType} PRIMARY KEY`;
+    } else {
+      return `${columnName} ${dataType}`;
+    }
+  })
     .join(",\n  ");
 
   if (argv.addBlankColumns) {
@@ -320,13 +337,22 @@ function generateDropTableStatement(table) {
 function generateInsertStatement(row) {
   const values = Object.values(row)
     .map((value, index) => {
-      if (Object.keys(row)[index] === argv.lookup) {
+      if (Object.keys(row)[index].toLowerCase() === argv.lookup.toLowerCase()) {
         const lookupValue = escapeSingleQuotes(value);
         if (!lookupTableValues[lookupValue]) {
           addLookupValue(lookupValue);
         }
         value = lookupTableValues[lookupValue];
       }
+
+      if (columnIndexToDataTypeMap[index] === "datetime") {
+        const parsedDate = moment(value, 'M/D/YY HH:mm');
+        if (parsedDate.isValid()) {
+          // Format the date in MariaDB compatible datetime format
+          value = parsedDate.format('YYYY-MM-DD HH:mm:ss');
+        }
+      }
+
       return `${quoteIfNeeded(value, columnIndexToDataTypeMap[index])}`;
     })
     .join(", ");
